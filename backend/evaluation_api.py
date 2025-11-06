@@ -1,0 +1,187 @@
+"""
+Backend API endpoints for adapter evaluation.
+"""
+
+import sys
+import os
+sys.path.append('/Users/macbook2024/Library/CloudStorage/Dropbox/Droid-FineTuning/adapter_fusion')
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
+# Import the evaluator
+from evaluate_adapters import AdapterEvaluator
+
+# Thread pool for running blocking evaluation
+executor = ThreadPoolExecutor(max_workers=1)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# Global state for evaluation progress
+evaluation_status = {
+    "running": False,
+    "progress": 0,
+    "current_question": 0,
+    "total_questions": 0,
+    "adapter_name": "",
+    "result": None,
+    "error": None
+}
+
+class EvaluationRequest(BaseModel):
+    adapter_name: str
+    training_data_path: Optional[str] = None
+    num_questions: int = 20
+    evaluate_base_model: bool = False
+
+@router.post("/api/evaluation/start")
+async def start_evaluation(request: EvaluationRequest):
+    """Start adapter evaluation."""
+    global evaluation_status
+    
+    if evaluation_status["running"]:
+        raise HTTPException(status_code=400, detail="Evaluation already running")
+    
+    try:
+        # Reset status
+        evaluation_status = {
+            "running": True,
+            "progress": 0,
+            "current_question": 0,
+            "total_questions": request.num_questions,
+            "adapter_name": request.adapter_name,
+            "result": None,
+            "error": None
+        }
+        
+        # Start evaluation in background
+        asyncio.create_task(run_evaluation(
+            request.adapter_name,
+            request.training_data_path,
+            request.num_questions,
+            request.evaluate_base_model
+        ))
+        
+        return {
+            "success": True,
+            "message": "Evaluation started",
+            "adapter_name": request.adapter_name
+        }
+    
+    except Exception as e:
+        logger.error(f"Failed to start evaluation: {e}")
+        evaluation_status["running"] = False
+        evaluation_status["error"] = str(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/api/evaluation/status")
+async def get_evaluation_status():
+    """Get current evaluation status."""
+    return {
+        "running": evaluation_status["running"],
+        "progress": evaluation_status["progress"],
+        "current_question": evaluation_status["current_question"],
+        "total_questions": evaluation_status["total_questions"],
+        "adapter_name": evaluation_status["adapter_name"],
+        "error": evaluation_status["error"]
+    }
+
+@router.get("/api/evaluation/result")
+async def get_evaluation_result():
+    """Get evaluation result."""
+    if evaluation_status["result"] is None:
+        raise HTTPException(status_code=404, detail="No evaluation result available")
+    
+    return {
+        "success": True,
+        "result": evaluation_status["result"]
+    }
+
+def run_evaluation_sync(adapter_name: str, training_data_path: Optional[str], num_questions: int, evaluate_base_model: bool = False):
+    """Synchronous evaluation function to run in thread pool."""
+    global evaluation_status
+    
+    try:
+        evaluator = AdapterEvaluator()
+        
+        # Get training data path if not provided
+        if not training_data_path:
+            try:
+                # First try to get original training data from session
+                session_dir = "/Users/macbook2024/Library/CloudStorage/Dropbox/AAA Backup/A Working/Arjun LLM Writing/local_qwen/sessions"
+                import glob
+                import json
+                
+                # Find session file for this adapter
+                session_files = glob.glob(os.path.join(session_dir, "session_*.json"))
+                for session_file in session_files:
+                    try:
+                        with open(session_file, 'r') as f:
+                            session_data = json.load(f)
+                            if session_data.get('adapter_name') == adapter_name:
+                                training_data_path = session_data.get('config', {}).get('train_data_path', '')
+                                if training_data_path:
+                                    logger.info(f"Found original training data from session: {training_data_path}")
+                                    break
+                    except:
+                        continue
+                
+                # Fallback to adapter config if session not found
+                if not training_data_path:
+                    config = evaluator.load_adapter_config(adapter_name)
+                    training_data_path = config.get('data', '')
+                    
+                    # If it's a directory, look for JSONL files
+                    if training_data_path and os.path.isdir(training_data_path):
+                        jsonl_files = glob.glob(os.path.join(training_data_path, "*.jsonl"))
+                        if jsonl_files:
+                            training_data_path = jsonl_files[0]
+                            logger.info(f"Using train.jsonl from adapter config (original dataset unknown)")
+            except Exception as e:
+                logger.error(f"Failed to load training data path: {e}")
+                raise ValueError(f"Could not load training data path: {e}")
+        
+        if not training_data_path or not os.path.exists(training_data_path):
+            raise ValueError(f"Training data path not found: {training_data_path}")
+        
+        logger.info(f"Using training data: {training_data_path}")
+        
+        # Progress callback
+        def update_progress(current, total, progress):
+            evaluation_status["current_question"] = current
+            evaluation_status["total_questions"] = total
+            evaluation_status["progress"] = progress
+            logger.info(f"Progress update: {current}/{total} ({progress}%)")
+        
+        # Run evaluation
+        eval_type = "base model" if evaluate_base_model else "adapter"
+        logger.info(f"Starting evaluation: {adapter_name} ({eval_type})")
+        result = evaluator.evaluate_adapter(adapter_name, training_data_path, num_questions, progress_callback=update_progress, use_base_model=evaluate_base_model)
+        
+        # Update status
+        evaluation_status["running"] = False
+        evaluation_status["progress"] = 100
+        evaluation_status["result"] = result
+        
+        logger.info(f"Evaluation complete: {result['scores']['overall']}/100")
+    
+    except Exception as e:
+        logger.error(f"Evaluation failed: {e}")
+        evaluation_status["running"] = False
+        evaluation_status["error"] = str(e)
+
+async def run_evaluation(adapter_name: str, training_data_path: Optional[str], num_questions: int, evaluate_base_model: bool = False):
+    """Run evaluation in background thread."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, run_evaluation_sync, adapter_name, training_data_path, num_questions, evaluate_base_model)
+
+def setup_evaluation_routes(app):
+    """Setup evaluation routes on FastAPI app."""
+    app.include_router(router)
+    logger.info("Evaluation API routes registered")
